@@ -1,0 +1,130 @@
+import csv
+import re
+import pyvisa
+from pathlib import Path
+
+
+VNA_RESOURCE = "TCPIP0::localhost::5025::SOCKET"
+LIMITS_FILE = "limits.txt"
+
+
+def parse_sectioned_csv(filepath):
+    tables = {}
+    current_table = None
+
+    with open(filepath, newline="") as f:
+        for line_number, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith("[") and line.endswith("]"):
+                current_table = line[1:-1].strip()
+
+                if not current_table:
+                    raise ValueError(f"Empty section name at line {line_number}")
+
+                tables[current_table] = []
+                continue
+
+            if current_table is None:
+                raise ValueError(f"CSV row outside section at line {line_number}")
+
+            row = next(csv.reader([line]))
+            tables[current_table].append(row)
+
+    return tables
+
+
+def sanitize_filename(name):
+    return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+
+
+def build_limit_data(rows):
+    """
+    Each row must be:
+
+        type,start_stim,end_stim,start_resp,end_resp
+
+    Example:
+
+        1,800000000,900000000,-10,-10
+    """
+
+    values = []
+
+    for row_index, row in enumerate(rows, start=1):
+        if len(row) != 5:
+            raise ValueError(
+                f"Limit row {row_index} must have 5 values: "
+                "type,start_stim,end_stim,start_resp,end_resp"
+            )
+
+        values.extend(float(item.strip()) for item in row)
+
+    segment_count = len(rows)
+
+    return [segment_count] + values
+
+
+def format_scpi_numeric_list(values):
+    return ",".join(f"{value:g}" for value in values)
+
+
+def create_and_save_limit_tables(instrument, filepath, channel=1):
+    tables = parse_sectioned_csv(filepath)
+
+    for table_name, rows in tables.items():
+        limit_data = build_limit_data(rows)
+        limit_data_string = format_scpi_numeric_list(limit_data)
+
+        safe_name = sanitize_filename(table_name)
+
+        # Get directory where this Python file exists
+        script_dir = Path(__file__).resolve().parent
+
+        # Build full output path
+        output_path = script_dir / f"{safe_name}.LIM"
+
+        # Convert to SCPI-friendly path string
+        output_path_str = str(output_path).replace("\\", "/")
+
+        create_command = f"CALC{channel}:LIM:DATA {limit_data_string}"
+        save_command = f'MMEM:STOR:LIM "{output_path_str}"'
+
+        print(f"Creating limit table: {table_name}")
+        print(create_command)
+        instrument.write(create_command)
+
+        print(f"Saving limit table as: {safe_name}.LIM")
+        print(save_command)
+        instrument.write(save_command)
+
+    print("Done.")
+
+
+def main():
+    rm = pyvisa.ResourceManager()
+
+    vna = rm.open_resource(VNA_RESOURCE)
+
+    # Important for raw TCP socket SCPI connections
+    vna.read_termination = "\n"
+    vna.write_termination = "\n"
+    vna.timeout = 5000
+
+    print(vna.query("*IDN?"))
+
+    create_and_save_limit_tables(
+        instrument=vna,
+        filepath=LIMITS_FILE,
+        channel=1,
+    )
+
+    vna.close()
+    rm.close()
+
+
+if __name__ == "__main__":
+    main()
